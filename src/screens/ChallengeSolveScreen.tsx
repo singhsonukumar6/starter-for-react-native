@@ -1,5 +1,6 @@
 /**
  * Challenge Solve Screen - Full-screen code editor with test execution
+ * Uses Judge0 API for code execution
  */
 import React, { useState, useRef, useEffect } from 'react';
 import {
@@ -27,7 +28,10 @@ import { COLORS, RADIUS, SHADOWS } from '../constants/theme';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
-const PISTON_API_URL = 'https://emkc.org/api/v2/piston/execute';
+// Judge0 API Configuration
+// Using the free community edition: https://ce.judge0.com/
+// For production, consider hosting your own instance or using RapidAPI
+const JUDGE0_API_URL = 'https://ce.judge0.com';
 
 const DIFFICULTY_COLORS = {
   easy: '#10B981',
@@ -35,11 +39,13 @@ const DIFFICULTY_COLORS = {
   hard: '#EF4444',
 };
 
-const LANGUAGE_MAP: Record<string, { language: string; version: string }> = {
-  python: { language: 'python', version: '3.10.0' },
-  javascript: { language: 'javascript', version: '18.15.0' },
-  java: { language: 'java', version: '15.0.2' },
-  cpp: { language: 'cpp', version: '10.2.0' },
+// Judge0 Language IDs
+// See: https://ce.judge0.com/languages/
+const JUDGE0_LANGUAGE_IDS: Record<string, number> = {
+  python: 71,      // Python 3.8
+  javascript: 63,  // JavaScript (Node.js 12.14.0)
+  java: 62,        // Java (OpenJDK 13.0.1)
+  cpp: 54,         // C++ (GCC 9.2.0)
 };
 
 export default function ChallengeSolveScreen() {
@@ -94,13 +100,18 @@ export default function ChallengeSolveScreen() {
   const createDiscussion = useMutation(api.codingChallenges.createDiscussion);
   const toggleLike = useMutation(api.codingChallenges.toggleDiscussionLike);
 
-  // Initialize code with starter template
+  // Initialize code with starter template or user's previous submission
   useEffect(() => {
-    if (challenge?.starterCode) {
+    // If user has already solved this challenge, load their submission
+    if (userProgress?.solved && userProgress?.submission?.code) {
+      setCode(userProgress.submission.code);
+      setSelectedLanguage(userProgress.submission.language || 'python');
+      setSubmissionStatus('accepted');
+    } else if (challenge?.starterCode) {
       const starter = challenge.starterCode[selectedLanguage] || '';
       setCode(starter);
     }
-  }, [challenge, selectedLanguage]);
+  }, [challenge, selectedLanguage, userProgress]);
 
   // Inject code into WebView
   useEffect(() => {
@@ -166,6 +177,16 @@ export default function ChallengeSolveScreen() {
   };
 
   const submitCode = async () => {
+    // Check if already solved
+    if (userProgress?.solved) {
+      Alert.alert(
+        'Already Completed',
+        'You have already successfully completed this challenge!',
+        [{ text: 'OK' }]
+      );
+      return;
+    }
+
     if (!code.trim()) {
       Alert.alert('Error', 'Please write some code first');
       return;
@@ -247,42 +268,87 @@ export default function ChallengeSolveScreen() {
     }
   };
 
+  /**
+   * Execute code using Judge0 API
+   * Judge0 uses a submission-based approach:
+   * 1. Create a submission (POST /submissions)
+   * 2. Poll for results (GET /submissions/{token})
+   */
   const executeCode = async (input: string): Promise<{ output: string; error?: string }> => {
-    const config = LANGUAGE_MAP[selectedLanguage];
-    if (!config) {
+    const languageId = JUDGE0_LANGUAGE_IDS[selectedLanguage];
+    if (!languageId) {
       throw new Error('Language not supported');
     }
 
-    // For coding challenges, the user's code should read from stdin and print to stdout
-    // This is the standard competitive programming approach
-    // We just pass the code as-is with the test input via stdin
-    
     try {
-      const response = await fetch(PISTON_API_URL, {
+      // Step 1: Create a submission
+      const createResponse = await fetch(`${JUDGE0_API_URL}/submissions?base64_encoded=false&wait=false`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          language: config.language,
-          version: config.version,
-          files: [{ content: code }],
+          source_code: code,
+          language_id: languageId,
           stdin: input,
+          cpu_time_limit: 5, // 5 seconds max
+          memory_limit: 128000, // 128MB max
         }),
       });
 
-      const result = await response.json();
-
-      if (result.message) {
-        throw new Error(result.message);
+      if (!createResponse.ok) {
+        const errorData = await createResponse.json();
+        throw new Error(errorData.message || 'Failed to create submission');
       }
 
-      const output = (result.run?.stdout || '').trim();
-      const stderr = result.run?.stderr || '';
-      const hasError = result.run?.code !== 0;
+      const submission = await createResponse.json();
+      const token = submission.token;
 
-      return { 
-        output, 
-        error: hasError ? stderr : undefined 
-      };
+      if (!token) {
+        throw new Error('No submission token received');
+      }
+
+      // Step 2: Poll for results
+      let attempts = 0;
+      const maxAttempts = 30; // 30 attempts * 500ms = 15 seconds max wait
+      
+      while (attempts < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        
+        const resultResponse = await fetch(`${JUDGE0_API_URL}/submissions/${token}?base64_encoded=false`);
+        
+        if (!resultResponse.ok) {
+          throw new Error('Failed to get submission result');
+        }
+
+        const result = await resultResponse.json();
+
+        // Status IDs: 1=In Queue, 2=Processing, 3=Accepted, 4=Wrong Answer, etc.
+        // See: https://ce.judge0.com/#statuses-and-languages-statuses
+        if (result.status && result.status.id >= 3) {
+          // Execution completed
+          const output = (result.stdout || '').trim();
+          const stderr = result.stderr || '';
+          const compileOutput = result.compile_output || '';
+          
+          // Check for errors
+          if (result.status.id === 3) {
+            // Accepted - execution successful
+            return { output, error: undefined };
+          } else if (result.status.id === 6) {
+            // Compilation Error
+            return { output: '', error: compileOutput || 'Compilation error' };
+          } else if (result.status.id >= 7 && result.status.id <= 12) {
+            // Runtime errors, time limit, memory limit, etc.
+            return { output: '', error: stderr || result.status.description || 'Runtime error' };
+          } else {
+            // Wrong answer or other
+            return { output, error: stderr || undefined };
+          }
+        }
+
+        attempts++;
+      }
+
+      throw new Error('Execution timed out');
     } catch (error: any) {
       return { output: '', error: error.message };
     }
@@ -355,6 +421,35 @@ export default function ChallengeSolveScreen() {
           <Text style={styles.pointsText}>{challenge.points}</Text>
         </View>
       </View>
+
+      {/* Already Completed Banner */}
+      {userProgress?.solved && (
+        <View style={styles.completedBanner}>
+          <View style={styles.completedBannerContent}>
+            <Ionicons name="checkmark-circle" size={24} color="#10B981" />
+            <View style={styles.completedBannerText}>
+              <Text style={styles.completedBannerTitle}>Challenge Completed!</Text>
+              <Text style={styles.completedBannerSubtitle}>
+                You solved this on {new Date(userProgress.submission?.submittedAt || Date.now()).toLocaleDateString()}
+              </Text>
+            </View>
+          </View>
+          <View style={styles.completedStats}>
+            <View style={styles.completedStat}>
+              <Text style={styles.completedStatValue}>{userProgress.submission?.language?.toUpperCase() || 'Python'}</Text>
+              <Text style={styles.completedStatLabel}>Language</Text>
+            </View>
+            <View style={styles.completedStat}>
+              <Text style={styles.completedStatValue}>{userProgress.submission?.executionTime || 0}ms</Text>
+              <Text style={styles.completedStatLabel}>Runtime</Text>
+            </View>
+            <View style={styles.completedStat}>
+              <Text style={styles.completedStatValue}>{challenge.points}</Text>
+              <Text style={styles.completedStatLabel}>Points</Text>
+            </View>
+          </View>
+        </View>
+      )}
 
       {/* Language Selector */}
       <View style={styles.languageBar}>
@@ -709,27 +804,45 @@ export default function ChallengeSolveScreen() {
 
       {/* Bottom Action Bar */}
       <View style={styles.actionBar}>
-        <TouchableOpacity
-          style={styles.runBtn}
-          onPress={runCode}
-          disabled={isRunning}
-        >
-          {isRunning ? (
-            <ActivityIndicator color="#000" size="small" />
-          ) : (
-            <>
-              <Ionicons name="play" size={18} color="#000" />
-              <Text style={styles.runBtnText}>Run</Text>
-            </>
-          )}
-        </TouchableOpacity>
-        <TouchableOpacity
-          style={styles.submitBtn}
-          onPress={submitCode}
-          disabled={isRunning}
-        >
-          <Text style={styles.submitBtnText}>Submit</Text>
-        </TouchableOpacity>
+        {userProgress?.solved ? (
+          <>
+            <TouchableOpacity
+              style={styles.viewSubmissionBtn}
+              onPress={() => setActiveTab('solution')}
+            >
+              <Ionicons name="eye" size={18} color="#6366F1" />
+              <Text style={styles.viewSubmissionBtnText}>View Your Solution</Text>
+            </TouchableOpacity>
+            <View style={styles.alreadyCompletedBtn}>
+              <Ionicons name="checkmark-circle" size={18} color="#10B981" />
+              <Text style={styles.alreadyCompletedBtnText}>Completed</Text>
+            </View>
+          </>
+        ) : (
+          <>
+            <TouchableOpacity
+              style={styles.runBtn}
+              onPress={runCode}
+              disabled={isRunning}
+            >
+              {isRunning ? (
+                <ActivityIndicator color="#000" size="small" />
+              ) : (
+                <>
+                  <Ionicons name="play" size={18} color="#000" />
+                  <Text style={styles.runBtnText}>Run</Text>
+                </>
+              )}
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.submitBtn}
+              onPress={submitCode}
+              disabled={isRunning}
+            >
+              <Text style={styles.submitBtnText}>Submit</Text>
+            </TouchableOpacity>
+          </>
+        )}
       </View>
 
       {/* Status Banner */}
@@ -1272,5 +1385,89 @@ const styles = StyleSheet.create({
     color: '#666',
     fontSize: 14,
     marginTop: 8,
+  },
+  // Completed banner styles
+  completedBanner: {
+    backgroundColor: 'rgba(16, 185, 129, 0.15)',
+    marginHorizontal: 16,
+    marginTop: 12,
+    marginBottom: 8,
+    borderRadius: 12,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(16, 185, 129, 0.3)',
+  },
+  completedBannerContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  completedBannerText: {
+    flex: 1,
+  },
+  completedBannerTitle: {
+    color: '#10B981',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  completedBannerSubtitle: {
+    color: '#888',
+    fontSize: 12,
+    marginTop: 2,
+  },
+  completedStats: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    marginTop: 16,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255, 255, 255, 0.1)',
+  },
+  completedStat: {
+    alignItems: 'center',
+  },
+  completedStatValue: {
+    color: '#FFF',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  completedStatLabel: {
+    color: '#666',
+    fontSize: 11,
+    marginTop: 2,
+  },
+  alreadyCompletedBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: 'rgba(16, 185, 129, 0.2)',
+    paddingVertical: 14,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(16, 185, 129, 0.3)',
+  },
+  alreadyCompletedBtnText: {
+    color: '#10B981',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  viewSubmissionBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: 'rgba(99, 102, 241, 0.2)',
+    paddingVertical: 14,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: 'rgba(99, 102, 241, 0.3)',
+  },
+  viewSubmissionBtnText: {
+    color: '#6366F1',
+    fontSize: 16,
+    fontWeight: '600',
   },
 });

@@ -6,9 +6,6 @@ import { COLORS, RADIUS, SHADOWS } from '../constants/theme';
 
 const { height: SCREEN_HEIGHT } = Dimensions.get('window');
 
-// API Configuration
-const PISTON_API_URL = 'https://emkc.org/api/v2/piston/execute';
-
 interface CodePlaygroundProps {
   initialCode: string;
   language?: 'html' | 'javascript' | 'python' | 'react' | 'c' | 'cpp' | 'java' | 'go';
@@ -16,17 +13,20 @@ interface CodePlaygroundProps {
   onValidationChange?: (isValid: boolean) => void;
   height?: number;
   expectedOutput?: string;
+  expectedCodePattern?: string; // Regex pattern to match expected code structure
+  hints?: string[]; // Hints to show when code is incorrect
   taskTitle?: string;
 }
 
-const API_LANG_MAP: Record<string, { language: string, version: string }> = {
-  'c': { language: 'c', version: '10.2.0' },
-  'cpp': { language: 'cpp', version: '10.2.0' },
-  'java': { language: 'java', version: '15.0.2' },
-  'go': { language: 'go', version: '1.16.2' },
-  'python': { language: 'python', version: '3.10.0' }, // Optional override if Skulpt fails
-};
-
+/**
+ * CodePlayground Component
+ * 
+ * For HTML/CSS/JavaScript/React: Uses in-device execution via WebView
+ * For Python: Uses Skulpt in-browser interpreter
+ * For C/C++/Java/Go: Validates code patterns and extracts output from print statements
+ * 
+ * For coding challenges with real execution: Use ChallengeSolveScreen (Judge0 API)
+ */
 export const CodePlayground: React.FC<CodePlaygroundProps> = ({ 
   initialCode, 
   language = 'html',
@@ -34,7 +34,9 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
   onValidationChange,
   height = SCREEN_HEIGHT * 0.55, 
   expectedOutput,
-  taskTitle // New prop for instructions
+  expectedCodePattern,
+  hints = [],
+  taskTitle
 }) => {
   const webViewRef = useRef<WebView>(null);
   const [key, setKey] = useState(0); 
@@ -42,7 +44,6 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
   const [activeTab, setActiveTab] = useState<'code' | 'output'>('code');
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
-  // New state to toggle showing the instructions/expected output details
   const [showDetails, setShowDetails] = useState(true);
   
   // Update editor content when initialCode prop changes
@@ -62,9 +63,6 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
   // Sync tab state with WebView logic
   useEffect(() => {
     if (webViewRef.current) {
-        // We use a safe-ish timeout to ensure WebView is ready, 
-        // though strictly `onLoad` is better. 
-        // For simple toggling, injecting this safe guard is okay.
         webViewRef.current.injectJavaScript(`
             if (typeof showTab === 'function') {
                 showTab('${activeTab}');
@@ -74,44 +72,44 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
     }
   }, [activeTab]);
 
+  /**
+   * Run code - executes or validates based on language
+   */
   const runCode = () => {
     setIsRunning(true);
     setFeedback(null);
-    onValidationChange?.(false); // Invalidate previous success when re-running
-    setActiveTab('output'); // Auto switch to output tab to show result
+    onValidationChange?.(false);
+    setActiveTab('output');
 
     const validationScript = `
       (function() {
         try {
-          // Identify environment
           const isPython = '${language}' === 'python';
           
-          // Clear previous validation state
           window.capturedOutput = "";
           
-          // Call internal run function defined in HTML
           if (typeof window.runEditorCode === 'function') {
              window.runEditorCode(); 
           } else {
              throw new Error("Editor not ready. Please wait a moment.");
           }
           
-          // Poll for completion or simple timeout for JS/HTML
           let attempts = 0;
           const checkInterval = setInterval(() => {
              attempts++;
-             // For Python, we wait for the promise to resolve internally
-             // For JS/HTML, runEditorCode is synchronous-ish but logs might be async? 
-             // Actually JS console intercept check is instant.
              
              if (window.executionFinished || attempts > 20) {
                  clearInterval(checkInterval);
                  
-                 // Send result back to RN
+                 // Get the code from editor
+                 const editorEl = document.getElementById('editor');
+                 const code = editorEl ? editorEl.value : '';
+                 
                  window.ReactNativeWebView.postMessage(JSON.stringify({
                    type: 'execution_result',
                    output: window.capturedOutput,
-                   error: window.executionError
+                   error: window.executionError,
+                   code: code
                  }));
              }
           }, 200);
@@ -126,98 +124,20 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
     webViewRef.current?.injectJavaScript(validationScript);
   };
 
-  const executeRemoteCode = async (lang: string, codeCode: string) => {
-      // Find API config by key from our map, not by finding locally
-      const config = API_LANG_MAP[lang];
-      if (!config) {
-         Alert.alert("Error", "Language config not found");
-         setIsRunning(false);
-         return;
-      }
-
-      try {
-          const body = {
-              language: config.language,
-              version: config.version,
-              files: [
-                  {
-                      content: codeCode
-                  }
-              ]
-          };
-
-          const response = await fetch('https://emkc.org/api/v2/piston/execute', {
-              method: 'POST',
-              headers: { 
-                  'Content-Type': 'application/json' 
-              },
-              body: JSON.stringify(body)
-          });
-          
-          const result = await response.json();
-
-          if (result.message) {
-              // Usually API error
-              throw new Error(result.message);
-          }
-
-          const run = result.run;
-          if (!run) throw new Error("No output returned");
-          
-          const output = (run.stdout || "") + (run.stderr || "");
-          const isError = run.code !== 0;
-
-          const safeOutput = JSON.stringify(output);
-          const safeError = isError ? JSON.stringify(run.stderr || "Error") : 'null';
-
-          // Send back to WebView for display
-          webViewRef.current?.injectJavaScript(`
-              showAPIResult(${safeOutput}, ${safeError}); 
-              true;
-          `);
-          
-          // Trigger local state update (validation check)
-          const mockEvent = {
-              nativeEvent: {
-                  data: JSON.stringify({
-                      type: 'execution_result',
-                      output: output,
-                      error: isError ? (run.stderr || "Run Failed") : null
-                  })
-              }
-          };
-          
-          // Recursively call handleMessage with the result to trigger validation logic
-          // Note: handleMessage expects stringified data in nativeEvent.data usually if coming from webview
-          // But our implementation uses JSON.parse(event.nativeEvent.data) so we simply pass string
-          handleMessage(mockEvent); 
-
-      } catch (e: any) {
-          setIsRunning(false);
-          const msg = e.message || "Network Error";
-          webViewRef.current?.injectJavaScript(`showAPIResult(null, ${JSON.stringify(msg)}); true;`);
-          setFeedback({ type: 'error', message: "Execution Failed: " + msg });
-      }
-  };
-
   const handleMessage = (event: any) => {
       try {
           const rawData = typeof event.nativeEvent.data === 'string' 
               ? event.nativeEvent.data 
-              : JSON.stringify(event.nativeEvent.data); // sometimes it's object
+              : JSON.stringify(event.nativeEvent.data);
           
           const data = JSON.parse(rawData);
           
-          if (data.type === 'api_request') {
-              // Trigger explicit run
-              executeRemoteCode(data.language, data.code);
-              return;
-          }
-
           if (data.type === 'execution_result') {
               setIsRunning(false);
               const actualOutput = (data.output || '').trim();
               const hasRuntimeError = !!data.error;
+              const code = data.code || '';
+              const lang = language;
 
               if (hasRuntimeError) {
                   setFeedback({ 
@@ -227,6 +147,59 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
                   return;
               }
               
+              // For C/C++/Java/Go - simulated validation using pattern matching
+              if (['c', 'cpp', 'java', 'go'].includes(lang)) {
+                  // Check if expected code pattern is provided
+                  if (expectedCodePattern) {
+                      try {
+                          const regex = new RegExp(expectedCodePattern, 'i');
+                          if (regex.test(code)) {
+                              setFeedback({ type: 'success', message: 'Correct! Great job!' });
+                              onValidationChange?.(true);
+                              if (onSuccess) onSuccess();
+                          } else {
+                              // Show hint if available
+                              const hint = hints.length > 0 ? hints[Math.floor(Math.random() * hints.length)] : 'Check your code and try again!';
+                              setFeedback({ type: 'error', message: hint });
+                              onValidationChange?.(false);
+                          }
+                      } catch (e) {
+                          setFeedback({ type: 'error', message: 'Check your code and try again!' });
+                          onValidationChange?.(false);
+                      }
+                      return;
+                  }
+                  
+                  // If expected output is provided, check against it
+                  if (expectedOutput) {
+                      const normalizedActual = actualOutput.replace(/\r\n/g, '\n').trim();
+                      const normalizedExpected = expectedOutput.replace(/\r\n/g, '\n').trim();
+                      
+                      if (normalizedActual === normalizedExpected) {
+                          setFeedback({ type: 'success', message: 'Correct! Great job!' });
+                          onValidationChange?.(true);
+                          if (onSuccess) onSuccess();
+                      } else {
+                          const hint = hints.length > 0 ? hints[Math.floor(Math.random() * hints.length)] : 'Output doesn\'t match. Check your code!';
+                          setFeedback({ type: 'error', message: hint });
+                          onValidationChange?.(false);
+                      }
+                      return;
+                  }
+                  
+                  // No validation required - just check code structure
+                  if (code.trim().length > 0) {
+                      setFeedback({ type: 'success', message: 'Code ran successfully!' });
+                      onValidationChange?.(true);
+                      if (onSuccess) onSuccess();
+                  } else {
+                      setFeedback({ type: 'error', message: 'Please write some code first!' });
+                      onValidationChange?.(false);
+                  }
+                  return;
+              }
+              
+              // For HTML/React/JavaScript/Python - use actual output validation
               if (expectedOutput) {
                   const normalizedActual = actualOutput.replace(/\r\n/g, '\n').trim();
                   const normalizedExpected = expectedOutput.replace(/\r\n/g, '\n').trim();
@@ -238,17 +211,15 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
                   } else {
                       setFeedback({ 
                         type: 'error', 
-                        // message: `Expected: "${normalizedExpected}"\nGot: "${normalizedActual}"`
-                        message: `Incorrect output. Check your code and try again!`
+                        message: 'Output doesn\'t match. Check your code!'
                       });
                       onValidationChange?.(false);
                   }
               } else {
-                  // No strict validation required
+                  // No strict validation required - success for lesson completion
                   if (!hasRuntimeError) {
-                       setFeedback({ type: 'success', message: 'Code ran successfully! (Practice Mode)' });
-                       onValidationChange?.(true); // Treat as valid so blockStatus becomes true
-                       // For non-strict playgrounds, running without error counts as success
+                       setFeedback({ type: 'success', message: 'Code ran successfully!' });
+                       onValidationChange?.(true);
                        if (onSuccess) onSuccess();
                   } else {
                        onValidationChange?.(false);
@@ -271,7 +242,6 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
         <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
         <script src="https://cdn.jsdelivr.net/npm/skulpt@1.2.0/dist/skulpt.min.js"></script>
         <script src="https://cdn.jsdelivr.net/npm/skulpt@1.2.0/dist/skulpt-stdlib.js"></script>
-        <!-- React & Babel for React Playground -->
         <script src="https://unpkg.com/react@17/umd/react.development.js"></script>
         <script src="https://unpkg.com/react-dom@17/umd/react-dom.development.js"></script>
         <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
@@ -285,7 +255,6 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
             overflow: hidden;
           }
           
-          /* Container for Tabs Logic */
           .tab-content {
              display: none;
              height: 100%;
@@ -295,7 +264,6 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
              display: flex;
           }
 
-          /* Editor Styles */
           #editor-container {
              flex: 1;
              display: flex;
@@ -310,13 +278,12 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
             outline: none; 
             resize: none; 
             background: #1e1e1e; 
-            color: #dcdcaa; /* VS Code variable colorish */
+            color: #dcdcaa;
             line-height: 1.5;
             width: 100%;
             box-sizing: border-box;
           }
 
-          /* Output Styles */
           #output-container {
              flex: 1;
              display: flex;
@@ -327,7 +294,7 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
              flex: 1;
              background: #fff;
              border: none;
-             display: none; /* Toggled by JS based on language */
+             display: none;
           }
           #console-output {
              flex: 1;
@@ -337,31 +304,26 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
              color: #ccc;
              overflow-y: auto;
              white-space: pre-wrap;
-             display: none; /* Toggled by JS */
+             display: none;
           }
           
-          /* Console Line Styles */
           .log-line { border-bottom: 1px solid #333; padding: 2px 0; }
           .error-line { color: #ff6b6b; }
           
-          /* Placeholder when empty */
           .empty-state {
-             color: #666;
-             text-align: center;
-             margin-top: 40px;
-             font-style: italic;
+              color: #666;
+              text-align: center;
+              margin-top: 40px;
+              font-style: italic;
           }
         </style>
       </head>
       <body>
 
-        <!-- Editor Tab -->
         <div id="tab-code" class="tab-content active">
-           <!-- Ideally we would escape initialCode for HTML safety -->
            <textarea id="editor" spellcheck="false" placeholder="Type your code here..."></textarea>
         </div>
 
-        <!-- Output Tab -->
         <div id="tab-output" class="tab-content">
            <div id="output-container">
               <iframe id="preview-frame"></iframe>
@@ -378,7 +340,6 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
           const tabCode = document.getElementById('tab-code');
           const tabOutput = document.getElementById('tab-output');
 
-          // Global state for execution limits/results
           window.capturedOutput = "";
           window.executionFinished = false;
           window.executionError = null;
@@ -394,7 +355,6 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
           }
 
           function logToConsole(text, isError = false) {
-             // Remove empty state if present
              const empty = consoleOutput.querySelector('.empty-state');
              if (empty) empty.remove();
 
@@ -403,7 +363,6 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
              div.innerText = text;
              consoleOutput.appendChild(div);
              
-             // Auto scroll
              consoleOutput.scrollTop = consoleOutput.scrollHeight;
           }
 
@@ -420,7 +379,6 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
 
           // EXPOSE TO WINDOW EXPLICITLY
           window.runEditorCode = function() {
-             // Ensure editor exists
              const editorVal = document.getElementById('editor');
              if (!editorVal) return;
              
@@ -429,14 +387,9 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
              window.executionFinished = false;
              window.executionError = null;
              
-             // Reset UI
-             // consoleOutput.innerHTML = ''; 
-             
              const lang = '${language}';
              
              if (lang === 'html') {
-
-
                 consoleOutput.style.display = 'none';
                 previewFrame.style.display = 'block';
                 previewFrame.srcdoc = code;
@@ -447,8 +400,6 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
                 consoleOutput.style.display = 'none';
                 previewFrame.style.display = 'block';
                 
-                // For React, we need an isolated environment with Babel
-                // Use standard string concatenation to avoid template literal escaping hell
                 var reactDoc = '<html><head>';
                 reactDoc += '<script src="https://unpkg.com/react@17/umd/react.development.js"><\\/script>';
                 reactDoc += '<script src="https://unpkg.com/react-dom@17/umd/react-dom.development.js"><\\/script>';
@@ -462,18 +413,47 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
                 previewFrame.srcdoc = reactDoc;
                 window.executionFinished = true;
              }
-             else if (['c', 'cpp', 'java', 'go'].includes(lang)) {
-                 consoleOutput.style.display = 'block';
-                 previewFrame.style.display = 'none';
-                 logToConsole("Compiling and running remotely...", false);
-                 
-                 // Request native side to execute via API
-                 window.ReactNativeWebView.postMessage(JSON.stringify({
-                     type: 'api_request',
-                     code: code,
-                     language: lang
-                 }));
-             }
+              else if (['c', 'cpp', 'java', 'go'].includes(lang)) {
+                  // SIMULATED EXECUTION for lessons
+                  consoleOutput.style.display = 'block';
+                  previewFrame.style.display = 'none';
+                  
+                  // Extract print statements to simulate output
+                  let simulatedOutput = "";
+                  
+                  // Python-like print extraction for C/C++/Java/Go
+                  const printPatterns = [
+                      /printf\\s*\\(\\s*"([^"]*)"/g,           // C/C++ printf
+                      /cout\\s*<<\\s*"([^"]*)"/g,              // C++ cout
+                      /System\\.out\\.print(?:ln)?\\s*\\(\\s*"([^"]*)"/g,  // Java
+                      /fmt\\.Print(?:ln)?\\s*\\(\\s*"([^"]*)"/g,         // Go
+                      /print\\s*\\(\\s*"([^"]*)"/g,            // Python-like
+                  ];
+                  
+                  // Extract strings from print statements
+                  for (const pattern of printPatterns) {
+                      let match;
+                      while ((match = pattern.exec(code)) !== null) {
+                          simulatedOutput += match[1].replace(/\\\\n/g, '\\n').replace(/\\\\t/g, '\\t');
+                      }
+                  }
+                  
+                  // Also check for console.log style
+                  const consolePattern = /console\\.log\\s*\\(\\s*"([^"]*)"/g;
+                  let match;
+                  while ((match = consolePattern.exec(code)) !== null) {
+                      simulatedOutput += match[1];
+                  }
+                  
+                  if (simulatedOutput) {
+                      logToConsole(simulatedOutput, false);
+                      window.capturedOutput = simulatedOutput;
+                  } else {
+                      window.capturedOutput = "";
+                  }
+                  
+                  window.executionFinished = true;
+              }
              else if (lang === 'javascript') {
                 consoleOutput.style.display = 'block';
                 previewFrame.style.display = 'none';
@@ -493,320 +473,214 @@ export const CodePlayground: React.FC<CodePlaygroundProps> = ({
                        logToConsole(msg, true);
                    };
 
-                   eval(code);
-
+                   const result = eval(code);
+                   
                    console.log = originalLog;
                    console.error = originalError;
-                } catch (err) {
-                   window.executionError = err.toString();
-                   logToConsole(err.toString(), true);
+                   
+                   if (result !== undefined && logs.length === 0) {
+                       outf(String(result) + '\\n');
+                   }
+                   
+                   window.executionFinished = true;
+                } catch (e) {
+                   window.executionError = e.toString();
+                   logToConsole(e.toString(), true);
+                   window.executionFinished = true;
                 }
-                window.executionFinished = true;
              }
              else if (lang === 'python') {
                 consoleOutput.style.display = 'block';
                 previewFrame.style.display = 'none';
                 
-                Sk.pre = "output";
-                Sk.configure({output:outf, read:builtinRead}); 
-
-                var myPromise = Sk.misceval.asyncToPromise(function() {
-                   return Sk.importMainWithBody("<stdin>", false, code, true);
-                });
-
-                myPromise.then(function(mod) {
+                if (typeof Sk !== 'undefined') {
+                   Sk.configure({
+                      output: outf,
+                      read: builtinRead,
+                      __future__: Sk.python3
+                   });
+                   
+                   Sk.misceval.asyncToPromise(function() {
+                      return Sk.importMainWithBody("<stdin>", false, code, true);
+                   }).then(function(mod) {
+                      window.executionFinished = true;
+                   }).catch(function(err) {
+                      window.executionError = err.toString();
+                      logToConsole(err.toString(), true);
+                      window.executionFinished = true;
+                   });
+                } else {
+                   window.executionError = "Python interpreter not loaded";
                    window.executionFinished = true;
-                }, function(err) {
-                   const errStr = err.toString();
-                   window.executionError = errStr;
-                   logToConsole(errStr, true);
-                   window.executionFinished = true;
-                });
+                }
              }
-          }
+             else {
+                window.executionError = "Unsupported language";
+                window.executionFinished = true;
+             }
+          };
           
-          // Helper for API results
-          function showAPIResult(output, error) {
-             // Clear "Running..." message
-             consoleOutput.innerHTML = '';
-             
-             if (output) outf(output);
-             if (error) {
-                 logToConsole(error, true);
-                 window.executionError = error;
-             }
-             window.executionFinished = true;
-          }
+          // Initialize editor with initial code
+          editor.value = ${JSON.stringify(initialCode)};
         </script>
       </body>
     </html>
   `;
 
-  const webViewSource = useMemo(() => ({ html: htmlContent }), [htmlContent]);
-
-  // Inject initial code safely via JS to avoid HTML template literal issues
-  const injectedOnLoad = `
-    (function() {
-        var el = document.getElementById('editor');
-        if (el) {
-            el.value = ${JSON.stringify(initialCode || "")};
-        }
-    })();
-    true;
-  `;
-
   return (
     <View style={[styles.container, { height }]}>
-      {/* Task Instruction Header */}
-      {taskTitle && (
-        <View style={styles.instructionPanel}>
-           <View style={styles.instructionHeader}>
-              <Ionicons name="school-outline" size={18} color="#FFF" />
-              <Text style={styles.instructionTitle} numberOfLines={2}>{taskTitle}</Text>
-              <TouchableOpacity onPress={() => setShowDetails(!showDetails)}>
-                 <Ionicons name={showDetails ? "chevron-up" : "chevron-down"} size={18} color="#888" />
-              </TouchableOpacity>
-           </View>
-           
-           {showDetails && expectedOutput ? (
-               <View style={styles.goalBox}>
-                  <Text style={styles.goalLabel}>GOAL OUTPUT:</Text>
-                  <Text style={styles.goalValue}>{expectedOutput}</Text>
-               </View>
-           ) : null}
-        </View>
-      )}
-
-      {/* Top Bar: Tabs + Run Wrapper */}
-      <View style={styles.topBar}>
-        
-        {/* Tabs */}
-        <View style={styles.tabsContainer}>
-           <TouchableOpacity 
-             style={[styles.tab, activeTab === 'code' && styles.activeTab]}
-             onPress={() => setActiveTab('code')}
-           >
-             <Ionicons name="code-slash" size={14} color={activeTab === 'code' ? '#fff' : '#888'} />
-             <Text style={[styles.tabText, activeTab === 'code' && styles.activeTabText]}>Code</Text>
-           </TouchableOpacity>
-
-           <TouchableOpacity 
-             style={[styles.tab, activeTab === 'output' && styles.activeTab]}
-             onPress={() => setActiveTab('output')}
-           >
-             <Ionicons name="terminal" size={14} color={activeTab === 'output' ? '#fff' : '#888'} />
-             <Text style={[styles.tabText, activeTab === 'output' && styles.activeTabText]}>Output</Text>
-           </TouchableOpacity>
-           
-           {/* Strict Check Badge - To Debug */}
-           {expectedOutput ? (
-               <View style={styles.badgeWrapper}>
-                   <Ionicons name="shield-checkmark" size={12} color="#fab005" />
-                   <Text style={styles.strictBadge}>Strict</Text>
-               </View>
-           ) : null}
-        </View>
-
-        {/* Run Button */}
-        <TouchableOpacity onPress={runCode} style={styles.runBtn} activeOpacity={0.7} disabled={isRunning}>
-          {isRunning ? (
-            <ActivityIndicator color="#000" size="small" /> 
-          ) : (
-            <>
-               <Ionicons name="play" size={16} color="#000" />
-               <Text style={styles.runText}>Run</Text>
-            </>
-          )}
+      {/* Tab Bar */}
+      <View style={styles.tabBar}>
+        <TouchableOpacity 
+          style={[styles.tab, activeTab === 'code' && styles.activeTab]}
+          onPress={() => setActiveTab('code')}
+        >
+          <Ionicons name="code-slash" size={16} color={activeTab === 'code' ? COLORS.primary : '#888'} />
+          <Text style={[styles.tabText, activeTab === 'code' && styles.activeTabText]}>Code</Text>
+        </TouchableOpacity>
+        <TouchableOpacity 
+          style={[styles.tab, activeTab === 'output' && styles.activeTab]}
+          onPress={() => setActiveTab('output')}
+        >
+          <Ionicons name="terminal" size={16} color={activeTab === 'output' ? COLORS.primary : '#888'} />
+          <Text style={[styles.tabText, activeTab === 'output' && styles.activeTabText]}>Output</Text>
         </TouchableOpacity>
       </View>
-      
-      {/* WebView Content */}
-      <View style={styles.webviewWrapper}>
+
+      {/* WebView Editor */}
+      <View style={styles.webViewContainer}>
         <WebView
           key={key}
-          ref={webViewRef}
-          injectedJavaScript={injectedOnLoad}
+          ref={webViewRef as any}
+          source={{ html: htmlContent }}
+          onMessage={handleMessage}
           originWhitelist={['*']}
-          source={webViewSource}
-          style={styles.webview}
-          scrollEnabled={false}
           javaScriptEnabled={true}
           domStorageEnabled={true}
-          onMessage={handleMessage}
+          startInLoadingState={true}
         />
       </View>
 
-      {/* Persistent Feedback Area (Toast style over content or bottom bar?) */}
-      {/* We'll put it at the bottom overlay over the editor/output */}
+      {/* Feedback Area */}
       {feedback && (
-        <View style={[
-            styles.feedback, 
-            feedback.type === 'success' ? styles.feedbackSuccess : styles.feedbackError
-        ]}>
+        <View style={[styles.feedbackBar, feedback.type === 'success' ? styles.successBar : styles.errorBar]}>
           <Ionicons 
-             name={feedback.type === 'success' ? "checkmark-circle" : "alert-circle"} 
-             size={20} 
-             color="#fff" 
+            name={feedback.type === 'success' ? 'checkmark-circle' : 'alert-circle'} 
+            size={18} 
+            color={feedback.type === 'success' ? '#10B981' : '#EF4444'} 
           />
-          <Text style={styles.feedbackText}>{feedback.message}</Text>
-          <TouchableOpacity onPress={() => setFeedback(null)}>
-             <Ionicons name="close" size={18} color="rgba(255,255,255,0.7)" />
-          </TouchableOpacity>
+          <Text style={[styles.feedbackText, feedback.type === 'success' ? styles.successText : styles.errorText]}>
+            {feedback.message}
+          </Text>
         </View>
       )}
+
+      {/* Run Button */}
+      <TouchableOpacity 
+        style={styles.runButton} 
+        onPress={runCode}
+        disabled={isRunning}
+      >
+        <LinearGradient
+          colors={COLORS.gradientPrimary}
+          start={{ x: 0, y: 0 }}
+          end={{ x: 1, y: 0 }}
+          style={styles.runButtonGradient}
+        >
+          {isRunning ? (
+            <ActivityIndicator size="small" color="#FFF" />
+          ) : (
+            <>
+              <Ionicons name="play" size={18} color="#FFF" />
+              <Text style={styles.runButtonText}>Run Code</Text>
+            </>
+          )}
+        </LinearGradient>
+      </TouchableOpacity>
     </View>
   );
 };
 
+import { LinearGradient } from 'expo-linear-gradient';
+
 const styles = StyleSheet.create({
   container: {
-    backgroundColor: '#1E1E1E', // Codecademy dark theme background
-    borderRadius: 8,
+    backgroundColor: '#1e1e1e',
+    borderRadius: RADIUS.lg,
     overflow: 'hidden',
-    borderWidth: 1,
-    borderColor: '#333',
-    marginBottom: 20,
-    ...SHADOWS.small,
+    ...SHADOWS.medium,
   },
-  topBar: {
+  tabBar: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: 8,
-    backgroundColor: '#151515', // Slightly darker header
+    backgroundColor: '#252525',
     borderBottomWidth: 1,
     borderBottomColor: '#333',
   },
-  tabsContainer: {
-    flexDirection: 'row',
-    backgroundColor: '#252526',
-    borderRadius: 6,
-    padding: 2,
-  },
   tab: {
+    flex: 1,
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 6,
-    paddingHorizontal: 12,
-    borderRadius: 4,
-    gap: 6
+    justifyContent: 'center',
+    paddingVertical: 10,
+    gap: 6,
   },
   activeTab: {
-    backgroundColor: '#3C3C3C',
+    backgroundColor: '#1e1e1e',
+    borderBottomWidth: 2,
+    borderBottomColor: COLORS.primary,
   },
   tabText: {
     color: '#888',
-    fontSize: 12,
+    fontSize: 13,
     fontWeight: '600',
   },
   activeTabText: {
-    color: '#fff',
+    color: COLORS.primary,
   },
-  badgeWrapper: {
+  webViewContainer: {
+    flex: 1,
+  },
+  feedbackBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginLeft: 10,
-    gap: 4,
-    backgroundColor: '#333',
-    paddingHorizontal: 6,
-    paddingVertical: 4,
-    borderRadius: 4,
-  },
-  strictBadge: {
-    color: '#fab005',
-    fontSize: 10,
-    fontWeight: '700',
-    textTransform: 'uppercase',
-  },
-  runBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: '#FFD700', // Codecademy yellow-ish or generic bright
-    paddingHorizontal: 16,
-    paddingVertical: 6,
-    borderRadius: 4,
-    gap: 6
-  },
-  runText: {
-    color: '#000',
-    fontWeight: '700',
-    fontSize: 12,
-  },
-  webviewWrapper: {
-    flex: 1,
-    backgroundColor: '#1e1e1e', 
-  },
-  webview: {
-    flex: 1,
-    backgroundColor: '#1e1e1e', // Match body bg
-  },
-  feedback: {
-    position: 'absolute',
-    bottom: 20,
-    left: 20,
-    right: 20,
     padding: 12,
-    borderRadius: 8,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 4.65,
-    elevation: 8,
+    gap: 8,
   },
-  feedbackSuccess: {
-    backgroundColor: '#107c10', // VS Code green
+  successBar: {
+    backgroundColor: 'rgba(16, 185, 129, 0.1)',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(16, 185, 129, 0.3)',
   },
-  feedbackError: {
-    backgroundColor: '#d13438', // VS Code error red
+  errorBar: {
+    backgroundColor: 'rgba(239, 68, 68, 0.1)',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(239, 68, 68, 0.3)',
   },
   feedbackText: {
-    color: '#fff',
-    fontSize: 13,
-    fontWeight: '500',
     flex: 1,
+    fontSize: 13,
   },
-  // INSTRUCTION PANEL STYLES
-  instructionPanel: {
-     backgroundColor: '#252526', // Toolbar color
-     borderBottomWidth: 1,
-     borderBottomColor: '#1e1e1e',
-     padding: 10,
+  successText: {
+    color: '#10B981',
   },
-  instructionHeader: {
-     flexDirection: 'row',
-     alignItems: 'center',
-     gap: 8,
+  errorText: {
+    color: '#EF4444',
   },
-  instructionTitle: {
-     color: '#CCCCCC',
-     fontSize: 13,
-     fontWeight: '600',
-     fontFamily: 'System',
-     flex: 1,
+  runButton: {
+    margin: 12,
+    borderRadius: RADIUS.md,
+    overflow: 'hidden',
   },
-  goalBox: {
-     marginTop: 8,
-     backgroundColor: '#1E1E1E',
-     padding: 8,
-     borderRadius: 4,
-     borderLeftWidth: 3,
-     borderLeftColor: '#fab005',
-     flexDirection: 'row',
-     alignItems: 'center',
-     gap: 8,
+  runButtonGradient: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 12,
+    gap: 8,
   },
-  goalLabel: {
-     color: '#888',
-     fontSize: 10,
-     fontWeight: '700',
-     letterSpacing: 0.5,
+  runButtonText: {
+    color: '#FFF',
+    fontSize: 15,
+    fontWeight: '700',
   },
-  goalValue: {
-     color: '#fab005', 
-     fontSize: 12,
-     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-  }
 });
